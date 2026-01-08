@@ -19,6 +19,7 @@ flowchart LR
 |----------|-------------|
 | [STRUCTURE.md](./STRUCTURE.md) | Repository layout and file organization |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System architecture and component design |
+| [OPTIMIZATIONS.md](./OPTIMIZATIONS.md) | Performance optimizations (FP8, sequence packing) |
 
 ## Module Documentation
 

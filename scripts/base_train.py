@@ -21,7 +21,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
+from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state, packing_dataloader_with_state, packing_dataloader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -68,6 +68,9 @@ parser.add_argument("--sample_every", type=int, default=2000, help="sample from 
 parser.add_argument("--save_every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model_tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Performance optimizations
+parser.add_argument("--use_packing", action="store_true", help="enable sequence packing to eliminate waste at document boundaries (10-30%% speedup)")
+parser.add_argument("--use_fp8", action="store_true", help="enable FP8 training on H100 GPUs via Transformer Engine (30-50%% speedup)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -134,12 +137,35 @@ if batch_ratio != 1.0:
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
-with torch.device("meta"):
-    # All tensors are created as meta tensors (they have shape/dtype but no data)
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
-model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # All tensors get initialized
+
+# FP8 model initialization (if requested and available)
+fp8_enabled = False
+fp8_autocast_ctx = nullcontext()
+if args.use_fp8:
+    try:
+        from nanochat.gpt_fp8 import GPTFP8, GPTConfig as FP8GPTConfig, fp8_available, get_fp8_autocast_context
+        if fp8_available():
+            print0("FP8 training enabled - using Transformer Engine")
+            with torch.device("meta"):
+                model_config = FP8GPTConfig(**model_config_kwargs)
+                model = GPTFP8(model_config)
+            model.to_empty(device=device)
+            model.init_weights()
+            fp8_enabled = True
+            fp8_autocast_ctx = get_fp8_autocast_context(enabled=True)
+        else:
+            print0("WARNING: FP8 requested but not available (requires H100+ GPU). Falling back to BF16.")
+    except ImportError as e:
+        print0(f"WARNING: FP8 requested but Transformer Engine not installed: {e}. Falling back to BF16.")
+
+# Standard BF16 model initialization (fallback or default)
+if not fp8_enabled:
+    with torch.device("meta"):
+        # All tensors are created as meta tensors (they have shape/dtype but no data)
+        model_config = GPTConfig(**model_config_kwargs)
+        model = GPT(model_config)
+    model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
+    model.init_weights() # All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -180,6 +206,16 @@ total_tokens = args.total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Params ratio: {args.total_batch_size * num_iterations / num_scaling_params:.2f}") # Chinchilla is ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+# Log optimization settings
+opt_flags = []
+if args.use_packing:
+    opt_flags.append("sequence_packing")
+if fp8_enabled:
+    opt_flags.append("fp8")
+if opt_flags:
+    print0(f"Performance optimizations enabled: {', '.join(opt_flags)}")
+else:
+    print0("Performance optimizations: none (baseline BF16 training)")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
@@ -202,9 +238,18 @@ if resuming:
 # Initialize the DataLoaders for train/val
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+
+# Choose dataloader based on packing flag
+# Note: validation always uses non-packing loader since we want to evaluate on all positions
 build_val_loader = lambda: tokenizing_distributed_data_loader(args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+if args.use_packing:
+    print0("Sequence packing enabled - masking document boundary losses for training")
+    train_loader = packing_dataloader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    x, y, loss_mask, dataloader_state_dict = next(train_loader)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    loss_mask = None  # no masking when packing is disabled
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -339,12 +384,18 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
+        # Use FP8 autocast if enabled, otherwise standard BF16 autocast
+        with fp8_autocast_ctx if fp8_enabled else autocast_ctx:
+            loss = model(x, y, loss_mask=loss_mask)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # prefetch the next batch while the GPU is busy with forward/backward
+        if args.use_packing:
+            x, y, loss_mask, dataloader_state_dict = next(train_loader)
+        else:
+            x, y, dataloader_state_dict = next(train_loader)
+            loss_mask = None
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
